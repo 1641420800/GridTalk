@@ -41,10 +41,13 @@ static uint32_t rnd(void) { rng_state = rng_state * 1664525u + 1013904223u; retu
 
 typedef struct {
   gridTalk_t gt;
-  USART_TypeDef uart;
   uint32_t nextTxUs;
   uint16_t node;
   uint8_t  bus;
+  /* 仿真UART发送侧状态(经txKick/txKickDone/txAbort钩子置位, 替代伪造寄存器) */
+  uint8_t  txIrqEn;        /* TXE中断已开(库请求交付字节) */
+  uint8_t  tcArm;          /* 等TC(末字节已交付) */
+  uint8_t  lastByte;       /* 最近一次txByte交付的字节(DR内容) */
   uint8_t  inFrame, frameDamaged;
   uint32_t frameStartUs;
 } inst_t;
@@ -80,7 +83,7 @@ static int cmdIdx(uint16_t c)
 }
 static void on_send_result(gridTalk_t *gt, uint16_t t, uint16_t c, uint8_t ok)
 {
-  inst_t *me = (inst_t *)gt->uart->sim;
+  inst_t *me = (inst_t *)gt->hw;
   if(ok) st_okByCmd[me->bus][cmdIdx(c)]++;
   else { st_failByCmd[me->bus][cmdIdx(c)]++; st_sendFail++; }
   (void)t;
@@ -90,7 +93,7 @@ static void on_rx(gridTalk_t *gt, uint16_t src, uint16_t cmd,
                   const uint8_t *d, uint16_t l)
 {
   (void)d; (void)l;
-  inst_t *me = (inst_t *)gt->uart->sim;
+  inst_t *me = (inst_t *)gt->hw;
   uint16_t node = me->node;
   if(node == 0)
   { /* 手柄: 只关心在线应答 */
@@ -141,6 +144,33 @@ static void dlv_flush(void)
   }
 }
 
+/* ---- 发送侧钩子: txByte交付字节, txKick等控制发送中断(替代伪造寄存器) ---- */
+static void ring_tx_byte(gridTalk_t *gt, uint8_t c)
+{
+  inst_t *me = (inst_t *)gt->hw;
+  me->lastByte = c;              /* 写入"DR", 由inst_pump搬到线上 */
+}
+
+static void ring_tx_kick(gridTalk_t *gt)
+{
+  inst_t *me = (inst_t *)gt->hw;
+  me->txIrqEn = 1;
+}
+
+static void ring_tx_kick_done(gridTalk_t *gt)
+{
+  inst_t *me = (inst_t *)gt->hw;
+  me->txIrqEn = 0;
+  me->tcArm = 1;
+}
+
+static void ring_tx_abort(gridTalk_t *gt)
+{
+  inst_t *me = (inst_t *)gt->hw;
+  me->txIrqEn = 0;
+  me->tcArm = 0;
+}
+
 /* ---- 发送泵: TXE逐字节 + TC收尾, 会话登记与碰撞检测 ---- */
 static void inst_pump(inst_t *me)
 {
@@ -148,7 +178,7 @@ static void inst_pump(inst_t *me)
   int guard = 0;
   while(guard++ < 1024 && gt->txState == GT_TX_SENDING)
   {
-    if((me->uart.CR1 & USART_CR1_TXEIE) && gt->txRingCount > 0)
+    if(me->txIrqEn && gt->txRingCount > 0)
     {
       if((int32_t)(g_us - me->nextTxUs) < 0) break;
       if(!me->inFrame)
@@ -172,9 +202,8 @@ static void inst_pump(inst_t *me)
           }
         }
       }
-      me->uart.SR |= USART_SR_TXE;
-      gridTalk_txIrq(gt);
-      uint8_t b = (uint8_t)me->uart.DR;
+      gridTalk_txIrq(gt);           /* 字节经txByte钩子写入lastByte */
+      uint8_t b = me->lastByte;
       { /* 模块内排队: 总线串行下发(并发交接的字节不交错) */
         uint32_t air = g_us + BUS_BYTE_US[me->bus] + BUS_LAT_US[me->bus];
         if((int32_t)(busAirFreeUs[me->bus] - air) > 0) air = busAirFreeUs[me->bus];
@@ -185,11 +214,11 @@ static void inst_pump(inst_t *me)
       st_bytes[me->bus]++;
       st_busyUs[me->bus] += BUS_BYTE_US[me->bus];
     }
-    else if((me->uart.CR1 & USART_CR1_TCIE) && gt->txRingCount == 0)
+    else if(me->tcArm && gt->txRingCount == 0)
     {
       if((int32_t)(g_us - me->nextTxUs) < 0) break;
-      me->uart.SR |= USART_SR_TC;
-      gridTalk_txIrq(gt);
+      me->tcArm = 0;   /* TC已确认 */
+      gridTalk_txCompleteIrq(gt);
       me->inFrame = 0;
     }
     else break;
@@ -233,12 +262,14 @@ static void inst_setup(uint16_t n, uint8_t bus)
 {
   inst_t *me = &I[n][bus];
   memset(me, 0, sizeof(*me));
-  me->uart.SR = USART_SR_TXE | USART_SR_TC;
-  me->uart.sim = me;
   me->node = n; me->bus = bus;
-  gridTalk_init(&me->gt, &me->uart, n);
+  gridTalk_init(&me->gt, me, n);             /* hw=本实例, 钩子经hw取回 */
   gridTalk_seed(&me->gt, 0x01000000u * n + bus * 0x7777u + 9u);
   me->gt.nowUs = fake_now;
+  me->gt.txByte = ring_tx_byte;
+  me->gt.txKick = ring_tx_kick;
+  me->gt.txKickDone = ring_tx_kick_done;
+  me->gt.txAbort = ring_tx_abort;
   me->gt.onRx = on_rx;
   me->gt.onSendResult = on_send_result;
   me->gt.byteUs = BUS_BYTE_US[bus];

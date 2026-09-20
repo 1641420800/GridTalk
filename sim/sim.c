@@ -162,11 +162,15 @@ struct rxEntry {
 };
 
 typedef struct {
-  USART_TypeDef uart;
   uint16_t id;
   uint32_t tickPhase;
   double   rxDelay;        /* 本节点固有的接收延时(0~1字节时间, 初始化时随机) */
 
+  /* 仿真UART发送侧状态(经txKick/txKickDone/txAbort钩子置位, 替代伪造寄存器):
+     txIrqEn=TXE中断已开(库请求交付字节); tcArm=等TC(末字节已交付);
+     txDrFull=字节待上线(DR占用); tcSet=字节上线完成(TC挂起) */
+  uint8_t  txIrqEn;
+  uint8_t  tcArm;
   uint8_t  txDrFull;
   uint8_t  txDrByte;
   uint8_t  txSchedActive;  /* 已排定上线时刻的字节(发送方启动抖动) */
@@ -295,7 +299,6 @@ void sim_tx_byte(gridTalk_t *gt, uint8_t c)
 {
   int n = (int)(gt - gts);
   dev_t *d = &devs[n];
-  d->uart.DR = c;
   if(g_packetMode)
   {
     /* 打包转发: 模块立即收下发来的字节写入包缓存(TXE不等待, 协议全速倾倒),
@@ -314,6 +317,26 @@ void sim_tx_byte(gridTalk_t *gt, uint8_t c)
   d->txDrFull = 1;
   d->txDrByte = c;
   d->tcSet = 0;
+}
+
+/* 发送中断控制钩子: 替代伪造寄存器的CR1位操作 */
+static void sim_tx_kick(gridTalk_t *gt)       /* 开TXE中断 */
+{
+  devs[(int)(gt - gts)].txIrqEn = 1;
+}
+
+static void sim_tx_kick_done(gridTalk_t *gt)  /* 关TXE开TC(末字节已交付) */
+{
+  dev_t *d = &devs[(int)(gt - gts)];
+  d->txIrqEn = 0;
+  d->tcArm = 1;
+}
+
+static void sim_tx_abort(gridTalk_t *gt)      /* 卡死兜底: 关发送中断 */
+{
+  dev_t *d = &devs[(int)(gt - gts)];
+  d->txIrqEn = 0;
+  d->tcArm = 0;
 }
 
 /* ================= 应用层回调 ================= */
@@ -536,22 +559,19 @@ static void relay_send_now(int n)
 /* ================= 周期任务 ================= */
 static void tick_one(int i)
 {
-  /* 仿真硬件寄存器状态: TXE=DR空, TC=传输完成 */
-  devs[i].uart.SR = (devs[i].txDrFull ? 0u : USART_SR_TXE) |
-                    (devs[i].tcSet ? USART_SR_TC : 0u);
   gridTalk_usTick(&gts[i], g_dtUs);
 
 #if GT_TX_IRQ
-  /* 仿真UART发送中断: TXE事件逐字节写出, TC事件帧收尾 */
-  if((devs[i].uart.CR1 & USART_CR1_TXEIE) && (devs[i].uart.SR & USART_SR_TXE))
+  /* 仿真UART发送中断: TXE事件(DR空)逐字节交付, TC事件(移位完成)帧收尾 */
+  if(devs[i].txIrqEn && gts[i].txRingCount > 0 && !devs[i].txDrFull)
   {
     gridTalk_txIrq(&gts[i]);
   }
-  if((devs[i].uart.CR1 & USART_CR1_TCIE) && devs[i].tcSet)
+  if(devs[i].tcArm && devs[i].tcSet && gts[i].txRingCount == 0)
   {
-    gridTalk_txIrq(&gts[i]);
+    gridTalk_txCompleteIrq(&gts[i]);
   }
-  /* TC标志确认: 帧已离开发送态则视为软件已清除(含usTick兜底收尾路径) */
+  /* TC标志确认: 帧已离开发送态则视为软件已清除(含卡死兜底收尾路径) */
   if(devs[i].tcSet && gts[i].txState != GT_TX_SENDING) devs[i].tcSet = 0;
 #endif
 }
@@ -692,15 +712,17 @@ static void init_all(void)
   {
     memset(&devs[i], 0, sizeof(devs[i]));
     stats_init(&devs[i].st);
-    devs[i].uart.sim = &devs[i];
     devs[i].lastTxEndAt = -1e9;
   }
   for(int i = 0; i < g_devCount; ++i)
   {
     devs[i].id = (uint16_t)i;
-    gridTalk_init(&gts[i], &devs[i].uart, (uint16_t)i);
+    gridTalk_init(&gts[i], NULL, (uint16_t)i);
     gts[i].nowUs = sim_now_us;
     gts[i].txByte = sim_tx_byte;
+    gts[i].txKick = sim_tx_kick;
+    gts[i].txKickDone = sim_tx_kick_done;
+    gts[i].txAbort = sim_tx_abort;
     gts[i].onRx = on_rx;
     gts[i].onSendResult = on_send_result;
     gts[i].idleGuardUs = g_idleGuardUs;   /* 空闲判定保障窗口(打包模式消除攒包侦听盲区) */

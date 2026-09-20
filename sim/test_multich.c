@@ -1,6 +1,6 @@
 /*
  * test_multich.c -- gridTalk_sendMulti / gridTalk_linkSeq 多信道冗余语义单元测试
- * 编译运行: 见文件底部注释; 依赖本目录 main.h(PC假HAL垫片)与 GridTalk.c
+ * 编译运行: 见文件底部注释; 依赖 GridTalk.c(与 build_run.ps1 一并构建)
  *
  * 验证点:
  *  A. sendMulti 两信道副本带同一序号, 线上字节完全一致;
@@ -18,20 +18,46 @@ static uint32_t g_fakeUs = 1000;
 static uint32_t fake_now_us(void) { return g_fakeUs; }
 #define BYTE_US 1042u
 
-/* ---- 信道: 假UART + 线上字节采集 ---- */
+/* ---- 信道: 线上字节采集(发送侧经txByte钩子写入, 替代伪造寄存器) ---- */
 typedef struct {
-  USART_TypeDef uart;
   uint8_t  wire[4096];
   uint16_t wireLen;
+  uint8_t  txIrqEn;        /* TXE中断已开(库请求交付字节) */
+  uint8_t  tcArm;          /* 等TC(末字节已交付) */
+  uint8_t  lastByte;       /* 最近一次txByte交付的字节(DR内容) */
 } chan_t;
 
 static void chan_init(chan_t *ch)
 {
   memset(ch, 0, sizeof(*ch));
-  ch->uart.SR = USART_SR_TXE | USART_SR_TC;
 }
 
-/* 驱动实例把txRing发完(TXE逐字节+TC收尾), 采集DR写入为线上字节.
+/* 发送侧钩子(实例经hw取回信道) */
+static void ch_tx_byte(gridTalk_t *gt, uint8_t c)
+{
+  ((chan_t *)gt->hw)->lastByte = c;
+}
+
+static void ch_tx_kick(gridTalk_t *gt)
+{
+  ((chan_t *)gt->hw)->txIrqEn = 1;
+}
+
+static void ch_tx_kick_done(gridTalk_t *gt)
+{
+  chan_t *ch = (chan_t *)gt->hw;
+  ch->txIrqEn = 0;
+  ch->tcArm = 1;
+}
+
+static void ch_tx_abort(gridTalk_t *gt)
+{
+  chan_t *ch = (chan_t *)gt->hw;
+  ch->txIrqEn = 0;
+  ch->tcArm = 0;
+}
+
+/* 驱动实例把txRing发完(TXE逐字节+TC收尾), 采集交付字节为线上字节.
    每次调用采集一帧(调用前重置), 调用方需在帧启动后一次性泵完 */
 static int g_pumpTxEvents = 0;   /* 累计"泵出过字节"的次数(≈上线次数, H用例) */
 static void chan_pump(gridTalk_t *gt, chan_t *ch)
@@ -40,18 +66,17 @@ static void chan_pump(gridTalk_t *gt, chan_t *ch)
   ch->wireLen = 0;   /* 每次泵送=采集当前这一帧, 不跨帧累积 */
   while(guard++ < 8192 && gt->txState == GT_TX_SENDING)
   {
-    if((gt->uart->CR1 & USART_CR1_TXEIE) && gt->txRingCount > 0)
+    if(ch->txIrqEn && gt->txRingCount > 0)
     {
-      gt->uart->SR |= USART_SR_TXE;
-      gridTalk_txIrq(gt);
-      ch->wire[ch->wireLen++] = (uint8_t)gt->uart->DR;
+      gridTalk_txIrq(gt);   /* 字节经txByte钩子写入lastByte */
+      ch->wire[ch->wireLen++] = ch->lastByte;
       if(ch->wireLen == 1) g_pumpTxEvents++;   /* 本次泵送产出首字节=一次上线 */
       g_fakeUs += BYTE_US;
     }
-    else if(gt->uart->CR1 & USART_CR1_TCIE)
+    else if(ch->tcArm && gt->txRingCount == 0)
     {
-      gt->uart->SR |= USART_SR_TC;
-      gridTalk_txIrq(gt);   /* 帧完成(离开SENDING) */
+      ch->tcArm = 0;   /* TC已确认 */
+      gridTalk_txCompleteIrq(gt);   /* 帧完成(离开SENDING) */
       g_fakeUs += BYTE_US;
     }
     else break;
@@ -97,8 +122,12 @@ static void on_rx(gridTalk_t *gt, uint16_t src, uint16_t cmd,
 
 static void gt_setup(gridTalk_t *gt, chan_t *ch, uint16_t id)
 {
-  gridTalk_init(gt, &ch->uart, id);
+  gridTalk_init(gt, ch, id);   /* hw=信道, 发送钩子经hw取回 */
   gt->nowUs = fake_now_us;
+  gt->txByte = ch_tx_byte;
+  gt->txKick = ch_tx_kick;
+  gt->txKickDone = ch_tx_kick_done;
+  gt->txAbort = ch_tx_abort;
   gt->onRx = on_rx;
 }
 

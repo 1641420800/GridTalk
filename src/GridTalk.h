@@ -5,7 +5,25 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#include "main.h"
+/* ================= 平台适配: 临界区 =================
+   核心不包含任何芯片头文件; 中断屏蔽原语经宏注入, 各调用点在同一作用域成对使用:
+     GT_CRIT_ENTER()  进入临界区(保存并关中断)
+     GT_CRIT_EXIT()   退出临界区(恢复中断)
+   须在任务与ISR上下文均安全(保存/恢复式, 而非成对开关式)。
+   选择顺序:
+   1. 定义 GT_PORT_HEADER(值为带引号的头文件名) -> 包含之, 由其提供两个宏;
+   2. ARM/CMSIS编译器(armclang/armcc/gcc-arm/iar) -> 自动包含随库的
+      port/gridtalk_port_cmsis.h(PRIMASK保存/恢复, 仅依赖cmsis_compiler.h);
+   3. 其余(单上下文/PC仿真/协作式调度) -> 默认空操作。 */
+#if defined(GT_PORT_HEADER)
+  #include GT_PORT_HEADER
+#elif defined(__ARMCC_VERSION) || defined(__ICCARM__) || \
+      (defined(__GNUC__) && (defined(__arm__) || defined(__thumb__)))
+  #include "../port/gridtalk_port_cmsis.h"
+#else
+  #define GT_CRIT_ENTER()
+  #define GT_CRIT_EXIT()
+#endif
 
 /*
 # 设计说明
@@ -33,12 +51,19 @@
   断链时另一信道独立承载(各自needAck重发互不影响)。
 
 - 调用约定:
-    gridTalk_init(gt, uart, id);
-    gt->nowUs = 平台us时钟(如DWT);   // NULL则用usTick累加时钟
-    gt->txByte = 平台发送函数;        // NULL则直接写uart->DR
+    gridTalk_init(gt, hw, id);        // hw=平台句柄(如USART2), 纯钩子接入可传NULL
+    gridTalk_setBaud(gt, 9600);       // 可选: 已知波特率直接定标byteUs(推荐)
+    gt->nowUs = 平台us时钟(如DWT);    // NULL则用usTick累加时钟
+    gt->txByte = 平台发送函数;        // 唯一发送出口(逐字节)
+    中断驱动(推荐): gt->txKick/txKickDone/txAbort = 发送中断控制钩子
+                    (STM32一行绑定: gridTalk_portBindUart(gt), 见port/);
+    轮询驱动: 上述三钩子保持NULL, usTick/rxByte入口按byteUs节流逐字节发送
+              (可选 gt->txReady 背压: 硬件未就绪时不写)
     gt->onRx = 接收回调;  gt->onSendResult = 发送结果回调;
     周期调用 gridTalk_usTick(gt, us); // 建议1ms或更快
     UART RX中断调用 gridTalk_rxByte(gt, c);
+    中断驱动: TXE中断调用 gridTalk_txIrq(gt)(可交付1字节),
+              TC中断调用 gridTalk_txCompleteIrq(gt)(末字节移位完成)
     发送: gridTalk_send(单播可靠/自主帧), gridTalk_sendReply(响应,立即接入),
           gridTalk_sendNoAck(尽力而为), gridTalk_sendMulti(多信道冗余, 副本同序号)
 */
@@ -133,10 +158,14 @@
 #endif
 
 /* 发送驱动模式:
-   1 = UART TXE中断逐字节发送(推荐): 字节节奏由硬件决定, 不受usTick周期限制,
-       最后一字节移位完成后由TC中断收尾(usTick冗余兜底);
-   0 = 轮询(旧): 依赖usTick/rxByte入口, 每入口最多发1字节 */
+   1 = 中断驱动(推荐): 平台提供 txKick/txKickDone/txAbort 钩子, 字节节奏由硬件
+       TXE中断决定, 不受usTick周期限制; 最后一字节移位完成后由TC中断收尾
+       (gridTalk_txIrq / gridTalk_txCompleteIrq 为平台中断入口);
+   0 = 轮询: 上述钩子不接, 依赖usTick/rxByte入口, 每入口按byteUs节流发1字节
+       (可选txReady背压) */
+#ifndef GT_TX_IRQ
 #define GT_TX_IRQ 1
+#endif
 #if GT_REPLY_START_CHARS > GT_REPLY_WINDOW_CHARS
 #error "GT_REPLY_START_CHARS must be <= GT_REPLY_WINDOW_CHARS"
 #endif
@@ -146,6 +175,8 @@ typedef struct gridTalk gridTalk_t;
 typedef void (*gt_txByte_cb)(gridTalk_t *gt, uint8_t c);
 typedef uint32_t (*gt_nowUs_cb)(void);
 typedef void (*gt_txFrame_cb)(gridTalk_t *gt);   /* 帧开始/结束(485半双工方向控制, 可选) */
+typedef void (*gt_txCtrl_cb)(gridTalk_t *gt);    /* 发送中断控制: txKick/txKickDone/txAbort */
+typedef uint8_t (*gt_txReady_cb)(gridTalk_t *gt);/* 轮询模式背压: 硬件可再收1字节? */
 typedef void (*gt_readData_cb)(gridTalk_t *gt, uint16_t src, uint16_t cmd,
                                const uint8_t *data, uint16_t len);
 typedef void (*gt_sendResult_cb)(gridTalk_t *gt, uint16_t target, uint16_t cmd, uint8_t ok);
@@ -182,11 +213,17 @@ typedef enum {
 } gtTxState_t;
 
 struct gridTalk {
-  USART_TypeDef * uart;
+  void *hw;                 /* 平台句柄(如USART_TypeDef*), 核心不解释; 供端口钩子取回硬件 */
   uint16_t id;
 
   /* 平台钩子 */
-  gt_txByte_cb    txByte;
+  gt_txByte_cb    txByte;   /* 发送出口(逐字节); NULL=无输出途径, 帧滞留队列 */
+  /* 发送中断控制(GT_TX_IRQ=1时由平台提供, 见port/gridtalk_port_stm32.h);
+     三者全NULL则该实例回退轮询节奏(usTick/rxByte入口按byteUs节流送txByte) */
+  gt_txCtrl_cb    txKick;      /* 帧字节已备好, 启动发送(平台: 开TXE中断) */
+  gt_txCtrl_cb    txKickDone;  /* 末字节已交付, 转等发送完成(平台: 关TXE开TC) */
+  gt_txCtrl_cb    txAbort;     /* 发送卡死兜底(平台: 关发送中断/清挂起标志) */
+  gt_txReady_cb   txReady;     /* 轮询模式可选背压: 硬件未就绪时不写 */
   gt_nowUs_cb     nowUs;
   gt_txFrame_cb   txFrameStart;      /* 帧开始发送(置485为发送方向, 可空) */
   gt_txFrame_cb   txFrameEnd;        /* 帧发送完成(485恢复接收方向, 可空) */
@@ -200,6 +237,9 @@ struct gridTalk {
 
   /* 自适应实测字节速率(us) */
   uint32_t byteUs;
+  uint32_t byteUsPending;   /* 自适应在途估计: 采样写入此值, 帧CRC通过才提交到
+                               byteUs, 坏帧/截断帧回滚(碰撞字节交错的杂乱间隔
+                               全落在坏帧里, 不得污染估计, 见gridTalk_rxByte) */
   uint32_t byteUsSamples;
 
   /* 空闲保障窗口(us): 随机接入/重发退避的范围扩展, GT_IDLE_GUARD_US 初始化 */
@@ -269,13 +309,15 @@ struct gridTalk {
 
 };
 
-void gridTalk_init(gridTalk_t *gt, USART_TypeDef * uart, uint16_t id);
+void gridTalk_init(gridTalk_t *gt, void *hw, uint16_t id);
+void gridTalk_setBaud(gridTalk_t *gt, uint32_t baud);   /* 按波特率定标byteUs(10bit/字节) */
 void gridTalk_setID(gridTalk_t *gt, uint16_t id);
 void gridTalk_seed(gridTalk_t *gt, uint32_t entropy);   /* 注入每次上电不同的熵并重定序号基值: 防确定性基值跨上电复现被对端当重发吞掉 */
 void gridTalk_usTick(gridTalk_t *gt, uint32_t us);
 void gridTalk_rxByte(gridTalk_t *gt, uint8_t c);
 #if GT_TX_IRQ
-void gridTalk_txIrq(gridTalk_t *gt);   /* UART TXE/TC中断入口(发送中断驱动模式) */
+void gridTalk_txIrq(gridTalk_t *gt);          /* 平台TXE事件: 数据寄存器空, 可交付1字节 */
+void gridTalk_txCompleteIrq(gridTalk_t *gt);  /* 平台TC事件: 末字节移位完成, 帧收尾 */
 #endif
 void gridTalk_send(gridTalk_t *gt, uint16_t target, uint16_t cmd,
                    const uint8_t *data, uint16_t len);

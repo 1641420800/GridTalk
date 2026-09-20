@@ -72,10 +72,12 @@ sim.exe [时长秒=120] [每字节误码率%=0.4] [设备数=6] [随机种子=42
 
 ## 已知固件问题(本仿真器发现)
 
-- **byteUs 自适应采样窗口 `0.5x~2x 当前值`**，锚定 `GT_DEFAULT_BYTE_US=1042`(9600bps)。
-  波特率高于约19.2k时帧内间隙恒低于下限被拒，byteUs 永远停留在默认值，发送节流按12倍慢速运行
-  （`-Baud 115200` 可复现：实测单字节时间=1042us, 理论=86us）。
-  修复方向：按实际波特率初始化 byteUs（如编译期配置或首帧放宽采样下限）。
+- **[已修复] byteUs 自适应采样窗口曾锚定 `GT_DEFAULT_BYTE_US=1042`**：
+  旧采样窗口 `0.5x~2x 当前值` 在波特率高于约19.2k时帧内间隙恒低于下限被拒，
+  byteUs 永远停留在默认值，发送节流按12倍慢速运行。修复：窗口放宽为
+  `byteUs/16 ~ 2x` 并只提交干净帧(CRC过)的样本(在途估计 byteUsPending,
+  坏帧回滚——碰撞字节交错的杂乱间隔不进均值)，另提供 `gridTalk_setBaud`
+  按已知波特率直接定标。`-Baud 115200` 实测：自适应收敛到 84us(理论86)。
 - **打包转发的对齐碰撞**: 攒包期间总线静默不可侦听(盲区=门限), 已由空闲保障窗
   (idleGuardUs, 打包模式自动=门限)随机化接入缓解; 剩余碰撞来自"两包同时到期突发"
   的对齐——9600bps/6台/0.4%误码下碰撞损坏帧约9%(旧"延迟投递"模型为26~30%)。
@@ -97,7 +99,7 @@ sim.exe [时长秒=120] [每字节误码率%=0.4] [设备数=6] [随机种子=42
 ## 可调参数(GridTalk.h)
 
 - `GT_IDLE_CHARS_X10` 空闲判定(4.5字符)、`GT_AUTO_BACKOFF_CHARS` 自主帧随机退避、
-  `GT_ACK_WINDOW_CHARS` ACK窗口(60字符, 下限250ms)、`GT_DEDUP_WINDOW_US` 去重窗口、
+  `GT_ACK_WINDOW_CHARS` ACK窗口(60字符, 下限250ms)、`GT_SEQ_WINDOW` 序号去重窗口、
   `GT_TX_FIFO_SIZE` 发送缓存(8)、`GT_RESEND_COUNT` 重发次数(5)。
 
 ## 调试开关（环境变量）
@@ -107,11 +109,10 @@ sim.exe [时长秒=120] [每字节误码率%=0.4] [设备数=6] [随机种子=42
 - `GRIDTALK_BURSTLOG=1`：打印线上每一帧（burst）的内容；
 - `-Debug` 构建：协议状态机事件打印（TX/ACK/JITTER/RETRY/GIVEUP/FIFO_DROP 等）。
 
-## 与固件构建的关系
+## 与平台层的关系
 
-GridTalk.c 增加了两个测试接缝，固件构建不受影响：
-
-- `GT_APP_PROVIDES_HOOKS`：定义后由应用提供 `GT_readData`/`GT_sendResult`
-  （固件不定义该宏，仍使用库内弱函数）；
-- `GT_UART_DR_WRITE(c)`：发送寄存器写抽象，默认展开为 `GT_UART->DR = (c)`，
-  仿真时替换为 `sim_tx_byte(c)`。
+核心库不含任何芯片头文件(平台接缝见 ../README.md 接入方法)。仿真器即第二个
+平台实例：每台设备以钩子接入仿真总线模型——`txByte` 交付字节、
+`txKick/txKickDone/txAbort` 模拟 TXE/TC 中断的开关(替代伪造寄存器)，
+`usTick` 由仿真时钟驱动。早期版本曾伪造 `USART_TypeDef` 寄存器结构并让库
+直写(sim/main.h)，平台接缝抽象后该垫片已删除。

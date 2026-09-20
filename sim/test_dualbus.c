@@ -38,20 +38,18 @@ static void ev_push(uint8_t b, uint32_t arrive, gridTalk_t *dst)
 
 /* ---- 实例与信道 ---- */
 typedef struct {
-  USART_TypeDef uart;
-  uint8_t wireByte;
-} fakeUart_t;
-
-typedef struct {
   gridTalk_t *gt;      /* 本端实例 */
   gridTalk_t *peer;    /* 对端实例(投递目标) */
   uint32_t   byteUs, latUs;
   uint32_t   nextTxUs; /* 下一字节/TC到期时刻(发送节拍) */
   uint32_t   lastTcUs; /* 最近一帧发送完成时刻(统计) */
+  /* 仿真UART发送侧状态(经txKick/txKickDone/txAbort钩子置位, 替代伪造寄存器) */
+  uint8_t    txIrqEn;  /* TXE中断已开(库请求交付字节) */
+  uint8_t    tcArm;    /* 等TC(末字节已交付) */
+  uint8_t    lastByte; /* 最近一次txByte交付的字节(DR内容) */
 } link_t;
 
 static gridTalk_t A1, A2, B1, B2;      /* A=发送端(id1) B=接收端(id2), 1=无线 2=485 */
-static fakeUart_t ua1, ua2, ub1, ub2;
 static link_t g_links[4];              /* A1->B1, A2->B2, B1->A1, B2->A2 */
 
 /* ---- 应用层钩子 ---- */
@@ -62,6 +60,31 @@ static gridTalk_t *g_execGt;           /* 最近一次执行所在实例 */
 static uint32_t g_execT, g_okT, g_tc1, g_tc2;
 
 static uint32_t fake_now_us(void) { return g_us; }
+
+/* ---- 发送侧钩子(替代伪造寄存器) ---- */
+static void db_tx_byte(gridTalk_t *gt, uint8_t c)
+{
+  ((link_t *)gt->hw)->lastByte = c;
+}
+
+static void db_tx_kick(gridTalk_t *gt)
+{
+  ((link_t *)gt->hw)->txIrqEn = 1;
+}
+
+static void db_tx_kick_done(gridTalk_t *gt)
+{
+  link_t *L = (link_t *)gt->hw;
+  L->txIrqEn = 0;
+  L->tcArm = 1;
+}
+
+static void db_tx_abort(gridTalk_t *gt)
+{
+  link_t *L = (link_t *)gt->hw;
+  L->txIrqEn = 0;
+  L->tcArm = 0;
+}
 
 static void on_rx(gridTalk_t *gt, uint16_t src, uint16_t cmd,
                   const uint8_t *d, uint16_t l)
@@ -92,27 +115,25 @@ static void link_pump(link_t *L)
   int guard = 0;
   while(guard++ < 512 && gt->txState == GT_TX_SENDING)
   {
-    if((gt->uart->CR1 & USART_CR1_TXEIE) && gt->txRingCount > 0)
+    if(L->txIrqEn && gt->txRingCount > 0)
     {
       if((int32_t)(g_us - L->nextTxUs) < 0) break;
-      gt->uart->SR |= USART_SR_TXE;
-      gridTalk_txIrq(gt);
-      ev_push((uint8_t)gt->uart->DR, g_us + L->byteUs + L->latUs, L->peer);
+      gridTalk_txIrq(gt);   /* 字节经txByte钩子写入lastByte */
+      ev_push(L->lastByte, g_us + L->byteUs + L->latUs, L->peer);
       L->nextTxUs = g_us + L->byteUs;
       if(gt->txRingCount == 0)
       { /* 末字节已写: 帧上线完成时刻=此刻+1字节时间. 只记命令窗口内首帧
-           (=sendMulti的转发帧; 后续本端帧如ACK-of-OK不覆盖).
-           不依赖TC分支采集——库内gtDrain的TC冗余兜底可能先行收尾(合法) */
+           (=sendMulti的转发帧; 后续本端帧如ACK-of-OK不覆盖) */
         uint32_t frameEnd = g_us + L->byteUs;
         if(gt == &A1 && g_tc1 == 0) g_tc1 = frameEnd;
         if(gt == &A2 && g_tc2 == 0) g_tc2 = frameEnd;
       }
     }
-    else if((gt->uart->CR1 & USART_CR1_TCIE) && gt->txRingCount == 0)
+    else if(L->tcArm && gt->txRingCount == 0)
     {
       if((int32_t)(g_us - L->nextTxUs) < 0) break;
-      gt->uart->SR |= USART_SR_TC;
-      gridTalk_txIrq(gt);
+      L->tcArm = 0;   /* TC已确认 */
+      gridTalk_txCompleteIrq(gt);
       L->lastTcUs = g_us;
     }
     else break;
@@ -169,13 +190,15 @@ static void settle(uint32_t maxMs)
   exit(1);
 }
 
-static void gt_setup(gridTalk_t *gt, fakeUart_t *fu, uint16_t id, uint32_t entropy)
+static void gt_setup(gridTalk_t *gt, uint16_t id, uint32_t entropy)
 {
-  memset(fu, 0, sizeof(*fu));
-  fu->uart.SR = USART_SR_TXE | USART_SR_TC;
-  gridTalk_init(gt, &fu->uart, id);
+  gridTalk_init(gt, NULL, id);
   gridTalk_seed(gt, entropy);
   gt->nowUs = fake_now_us;
+  gt->txByte = db_tx_byte;
+  gt->txKick = db_tx_kick;
+  gt->txKickDone = db_tx_kick_done;
+  gt->txAbort = db_tx_abort;
   gt->onRx = on_rx;
   gt->onSendResult = on_send_result;
 }
@@ -187,10 +210,10 @@ static int failures = 0;
 
 int main(void)
 {
-  gt_setup(&A1, &ua1, 1, 0x11111111u);
-  gt_setup(&A2, &ua2, 1, 0x22222222u);   /* 同id不同熵: 两信道退避序列独立(与固件一致) */
-  gt_setup(&B1, &ub1, 2, 0x33333333u);
-  gt_setup(&B2, &ub2, 2, 0x44444444u);
+  gt_setup(&A1, 1, 0x11111111u);
+  gt_setup(&A2, 1, 0x22222222u);   /* 同id不同熵: 两信道退避序列独立(与固件一致) */
+  gt_setup(&B1, 2, 0x33333333u);
+  gt_setup(&B2, 2, 0x44444444u);
   gridTalk_linkSeq(&A1, &A2);
   gridTalk_linkSeq(&B1, &B2);
   /* 固件已按波特率定标byteUs(见main.c): 485实例从87us起步, 不再默认1042.
@@ -203,6 +226,7 @@ int main(void)
   lA2->gt=&A2; lA2->peer=&B2; lA2->byteUs=CH2_BYTE_US; lA2->latUs=CH2_LAT_US;
   lB1->gt=&B1; lB1->peer=&A1; lB1->byteUs=CH1_BYTE_US; lB1->latUs=CH1_LAT_US;
   lB2->gt=&B2; lB2->peer=&A2; lB2->byteUs=CH2_BYTE_US; lB2->latUs=CH2_LAT_US;
+  A1.hw = lA1; A2.hw = lA2; B1.hw = lB1; B2.hw = lB2;   /* 发送钩子经hw取回链路 */
 
   gridTalk_t *gtsA[2] = {&A1, &A2};
 

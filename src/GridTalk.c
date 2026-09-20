@@ -117,7 +117,7 @@ static void gtStartFrame(gridTalk_t *gt)
   gt->txSendStartUs = gtNowUs(gt);   /* SENDING卡死兜底的起点 */
   if(gt->txFrameStart) gt->txFrameStart(gt);   /* 485: 置发送方向 */
 #if GT_TX_IRQ
-  if(gt->uart) gt->uart->CR1 |= USART_CR1_TXEIE;  /* 开TXE中断, 逐字节发送 */
+  if(gt->txKick) gt->txKick(gt);   /* 平台: 开TXE中断, 逐字节发送 */
 #endif
 }
 
@@ -177,7 +177,7 @@ static void gtDrain(gridTalk_t *gt)
 
   /* ---- 应答绝对优先: 不发送中且总线空闲即发(响应, 立即接入).
      ACK格式FF FC+被确认方ID+确认方ID: 发送侧流水线多帧在途, 按确认方对账 ---- */
-  if(gt->ackCount > 0 && gt->txState != GT_TX_SENDING && gtReplyReady(gt))
+  if(gt->ackCount > 0 && gt->txByte && gt->txState != GT_TX_SENDING && gtReplyReady(gt))
   {
     gt->txResumeState = gt->txState;
     gt->ackTargetId = gt->ackQueue[gt->ackHead];
@@ -195,46 +195,39 @@ static void gtDrain(gridTalk_t *gt)
     gt->txSendStartUs = now;   /* SENDING卡死兜底的起点 */
     if(gt->txFrameStart) gt->txFrameStart(gt); /* 485: ACK也是帧, 置发送方向 */
 #if GT_TX_IRQ
-    if(gt->uart) gt->uart->CR1 |= USART_CR1_TXEIE;  /* ACK字节流也由TXE中断发送 */
+    if(gt->txKick) gt->txKick(gt);  /* ACK字节流也由TXE中断发送 */
 #endif
   }
 
   /* ---- 发送排空: 按实测字节速率节流, 不依赖固定tick ---- */
-#if GT_TX_IRQ
-  /* SENDING卡死兜底: TXE/TC中断全部停摆(硬件异常/配置被破坏)时, 状态机会永久停在
-     SENDING且gtTxBusy恒真 -> 本信道把后续所有字节当自身回显丢弃, 全聋全哑:
-     发不出ping -> 所有设备~50s内被判离线, 而手柄屏幕一切正常. 强制收尾自愈.
+  /* SENDING卡死兜底(两模式通用): 发送中断停摆(TXE永不到来)或轮询输出长期受阻时,
+     状态机会永久停在SENDING且gtTxBusy恒真 -> 本信道把后续所有字节当自身回显丢弃,
+     全聋全哑: 发不出ping -> 所有设备~50s内被判离线, 而手柄屏幕一切正常.
+     超限强制收尾自愈, txAbort钩子由平台关发送中断/清挂起标志.
      Flash擦除冻结CPU期间全系统(含本函数)一起停摆, 不会误触发 */
   if(gt->txState == GT_TX_SENDING &&
      (int32_t)(now - gt->txSendStartUs) >
        (int32_t)(((uint32_t)gt->txCurrent.len * 2u + 16u) * gt->byteUs * 3u + 500000u))
   {
-    if(gt->uart)
-    {
-      gt->uart->CR1 &= (uint32_t)~(USART_CR1_TXEIE | USART_CR1_TCIE);
-      gt->uart->SR  &= (uint32_t)~USART_SR_TC;
-    }
+    if(gt->txAbort) gt->txAbort(gt);
     gtRingClear(gt);
     gtTxFrameDone(gt);
   }
-  /* TXE中断模式: 字节由UART中断逐字节写出, 此处不再轮询;
-     TC收尾由gridTalk_txIrq处理, 这里仅作冗余兜底(TC中断异常丢失时) */
-  if(gt->uart && gt->txState == GT_TX_SENDING && gt->txRingCount == 0 &&
-     (gt->uart->CR1 & USART_CR1_TCIE) && (gt->uart->SR & USART_SR_TC))
-  {
-    gt->uart->CR1 &= (uint32_t)~USART_CR1_TCIE;
-    gt->uart->SR  &= (uint32_t)~USART_SR_TC;   /* 清TC */
-    gtTxFrameDone(gt);
-  }
+#if GT_TX_IRQ
+  /* TC收尾只由平台TC事件驱动(gridTalk_txCompleteIrq): 末字节"写入DR"到
+     "移位完成"之间可能隔着排队/上线时间(总线争用/打包转发), 纯时间推算
+     会提前收尾使状态机与空中时序脱节。TC中断丢失的故障路径由上面的
+     SENDING卡死兜底覆盖(txAbort+收尾), 只是恢复更慢 */
 #else
-  if(gt->uart && gt->txState == GT_TX_SENDING)
+  /* 轮询模式: 按实测字节速率节流逐字节送txByte(可选txReady背压) */
+  if(gt->txState == GT_TX_SENDING)
   {
     while(gt->txRingCount > 0 && (now - gt->lastTxByteUs) >= gt->byteUs)
     {
-      if(!(gt->uart->SR & USART_SR_TXE)) break;
+      if(gt->txReady && !gt->txReady(gt)) break;
       uint8_t c;
       gtRingRead(gt, &c);
-      if(gt->txByte) gt->txByte(gt, c); else gt->uart->DR = c;
+      if(gt->txByte) gt->txByte(gt, c);
       gt->lastTxByteUs = now;
       now = gtNowUs(gt);
     }
@@ -290,6 +283,7 @@ static void gtDrain(gridTalk_t *gt)
   case GT_TX_IDLE:
   {
     int idx = -1;
+    if(!gt->txByte) break;   /* 无发送出口(纯接收实例): 帧滞留队列, gridTalk_pending可见 */
     /* 选取最早的非在途帧: QUEUED(新帧/重试)优先, 也恢复已选中但条件未就绪
        (总线忙/应答未到时)的ONWIRE帧, 避免其滞留; 重试退避中的帧跳过 */
     for(uint8_t i = 0; i < gt->txFifoCount; ++i)
@@ -422,37 +416,33 @@ static void gtSendFrame(gridTalk_t *gt, uint16_t target, uint16_t cmd,
 void gridTalk_send(gridTalk_t *gt, uint16_t target, uint16_t cmd,
                    const uint8_t *data, uint16_t len)
 {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   gtSendFrame(gt, target, cmd, data, len, (target != Bcast) ? 1 : 0, 0);
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 void gridTalk_sendReply(gridTalk_t *gt, uint16_t target, uint16_t cmd,
                         const uint8_t *data, uint16_t len)
 {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   gtSendFrame(gt, target, cmd, data, len, (target != Bcast) ? 1 : 0, 1);
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 void gridTalk_sendNoAck(gridTalk_t *gt, uint16_t target, uint16_t cmd,
                         const uint8_t *data, uint16_t len)
 {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   gtSendFrame(gt, target, cmd, data, len, 0, 0);
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 void gridTalk_sendReplyNoAck(gridTalk_t *gt, uint16_t target, uint16_t cmd,
                              const uint8_t *data, uint16_t len)
 {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   gtSendFrame(gt, target, cmd, data, len, 0, 1);
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 /* 多信道冗余发送(见GridTalk.h): 一个逻辑命令只取一次序号, 全部副本共用。
@@ -462,8 +452,7 @@ void gridTalk_sendMulti(gridTalk_t *gts[], uint8_t count, uint16_t target, uint1
                         const uint8_t *data, uint16_t len)
 {
   if(count == 0 || gts == NULL || gts[0] == NULL) return;
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   uint16_t seq = gtSeqNext(gts[0]);   /* 自gts[0]所在序号域一次性分配 */
   uint8_t needAck = (target != Bcast) ? 1 : 0;
   for(uint8_t i = 0; i < count; ++i)
@@ -471,7 +460,7 @@ void gridTalk_sendMulti(gridTalk_t *gts[], uint8_t count, uint16_t target, uint1
     if(gts[i] == NULL) continue;
     gtSendFrameSeq(gts[i], target, cmd, data, len, needAck, 0, seq);
   }
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 /* 序号域并入(见GridTalk.h): 解析host的域根(支持链式并入)后挂接, 防成环 */
@@ -514,6 +503,11 @@ static void gtLinkRx(gridTalk_t *gt, const uint8_t* data, uint16_t len)
 
   /* 调试钩子: 每收到一个完整帧都上报(含坏帧), 供上位机实时看总线 */
   if(gt->onRxRaw) gt->onRxRaw(gt, data, len, crcOk);
+
+  /* 字节速率自适应提交/回滚: 干净帧的实测间隔才可信, 见gridTalk_rxByte。
+     len不在帧范围内的"帧"同样按坏帧回滚 */
+  if(crcOk) gt->byteUs = gt->byteUsPending;
+  else gt->byteUsPending = gt->byteUs;
 
   if(!crcOk && gt->rxBadFrames < 0xFFFF) gt->rxBadFrames++;   /* 诊断: 信道质量计数 */
 
@@ -647,6 +641,7 @@ static void gtUnescape(gridTalk_t *gt, uint8_t c)
         gtNoteCollision(gt);   /* 帧被截断/打坏: 碰撞残骸, 礼让重发方 */
         gt->rxStatus = 0;
         gt->rxLen = 0;
+        gt->byteUsPending = gt->byteUs;   /* 截断帧的间隔样本不可信, 回滚 */
       }
     }
   }
@@ -695,83 +690,82 @@ void gridTalk_rxByte(gridTalk_t *gt, uint8_t c)
   }
   if(gt->rxBytes < 0xFFFF) gt->rxBytes++;   /* 诊断: 总线活动字节计数(不含自身回显) */
 
-  /* 字节速率自适应测量: 仅采样帧内字节间隔(第2字节起),
-     避免把"接入立即发送"产生的帧间间隙混入均值 */
-  if(gt->rxStatus == 1 && gt->rxLen >= 1 &&
-     gap >= gt->byteUs / 2 && gap <= gt->byteUs * 2)
+  /* 字节速率自适应测量: 仅采样帧内字节间隔(第2字节起), 写入在途估计
+     byteUsPending; 帧CRC通过时才提交到byteUs(gtLinkRx), 坏帧/截断帧回滚 --
+     碰撞时两发送方的字节在接收端随机相位交错, 间隔可以是任意值,
+     直接进EMA会把估计拖垮(min曾到174us), 引发次波特率发送速率互撞升级。
+     窗口[pending/16, pending*2]: 上限排除帧中停顿(对端冻结/打包转发间隙);
+     下限允许自默认9600基值向高波特率收敛(115200帧内间隙86us, 旧下限
+     0.5x基值=521us恒拒采 -> byteUs钉死在默认值, 发送按12倍慢速节流) */
   {
-    gt->byteUs = (gt->byteUs * 7 + gap) / 8;
-    gt->byteUsSamples++;
+    uint32_t ref = gt->byteUsPending;
+    uint32_t gapLo = ref / 16u;
+    if(gapLo < 2u) gapLo = 2u;
+    if(gt->rxStatus == 1 && gt->rxLen >= 1 &&
+       gap >= gapLo && gap <= ref * 2u)
+    {
+      gt->byteUsPending = (gt->byteUsPending * 7 + gap) / 8;
+      gt->byteUsSamples++;
+    }
   }
 
   /* 临界区(帧解析+排空): 防止更高优先级的usTick定时中断在同一实例上
      再入gtDrain, 造成txFifo/ackQueue双重消费与发送状态机错乱 */
-  {
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    gtUnescape(gt, c);
-    /* 收到字节后立即尝试排空, 响应帧及时发出 */
-    gtDrain(gt);
-    __set_PRIMASK(primask);
-  }
+  GT_CRIT_ENTER();
+  gtUnescape(gt, c);
+  /* 收到字节后立即尝试排空, 响应帧及时发出 */
+  gtDrain(gt);
+  GT_CRIT_EXIT();
 }
 
 /* ================= 周期处理 ================= */
 void gridTalk_usTick(gridTalk_t *gt, uint32_t us)
 {
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
+  GT_CRIT_ENTER();
   if(!gt->nowUs) gt->_nowUs += us;
   gtDrain(gt);
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 
 #if GT_TX_IRQ
-/* UART TXE/TC中断入口: 发送中断驱动模式下逐字节写出, 帧收尾.
-   临界区: txRing/txState同样被usTick的gtDrain访问, 防止更高优先级定时中断再入 */
+/* 平台TXE事件入口: 发送数据寄存器已空, 可交付下一字节(逐字节)。
+   临界区: txRing/txState同样被usTick的gtDrain访问, 防止更高优先级定时中断再入;
+   txKickDone钩子在末字节交付后被调(平台此时关TXE开TC), 须为短小寄存器操作 */
 void gridTalk_txIrq(gridTalk_t *gt)
 {
-  uint32_t sr;
-  if(!gt->uart || gt->txState != GT_TX_SENDING) return;
-  sr = gt->uart->SR;
-
-  uint32_t primask = __get_PRIMASK();
-  __disable_irq();
-
-  /* TXE: 移位寄存器空闲, 可写下一字节 */
-  if((sr & USART_SR_TXE) && gt->txRingCount > 0)
+  uint8_t c;
+  if(gt->txState != GT_TX_SENDING || !gt->txByte) return;
+  GT_CRIT_ENTER();
+  if(gtRingRead(gt, &c))
   {
-    uint8_t c;
-    gtRingRead(gt, &c);
-    if(gt->txByte) gt->txByte(gt, c); else gt->uart->DR = c;
+    gt->txByte(gt, c);
     gt->lastTxByteUs = gtNowUs(gt);
-    if(gt->txRingCount == 0)
-    {
-      /* 最后一字节已写入DR: 关TXE中断, 等TC(移位完成)后收尾 */
-      gt->uart->CR1 = (gt->uart->CR1 & (uint32_t)~USART_CR1_TXEIE) | USART_CR1_TCIE;
-    }
-    __set_PRIMASK(primask);
-    return;
+    if(gt->txRingCount == 0 && gt->txKickDone) gt->txKickDone(gt);
   }
+  GT_CRIT_EXIT();
+}
 
-  /* TC: 最后一字节移位完成, 帧真正发完 */
-  if((sr & USART_SR_TC) && gt->txRingCount == 0)
+/* 平台TC事件入口: 末字节移位完成, 帧真正发完(485换向/在途挂账在此)。
+   平台应先清自身TC标志/关TC中断再调用; 状态守卫使迟到的TC事件安全无害 */
+void gridTalk_txCompleteIrq(gridTalk_t *gt)
+{
+  if(gt->txState != GT_TX_SENDING || gt->txRingCount != 0) return;
+  GT_CRIT_ENTER();
+  if(gt->txState == GT_TX_SENDING && gt->txRingCount == 0)
   {
-    gt->uart->CR1 &= (uint32_t)~USART_CR1_TCIE;
-    gt->uart->SR  &= (uint32_t)~USART_SR_TC;   /* 清TC */
     gtTxFrameDone(gt);
   }
-
-  __set_PRIMASK(primask);
+  GT_CRIT_EXIT();
 }
 #endif
 
 /* ================= 初始化 ================= */
-void gridTalk_init(gridTalk_t *gt, USART_TypeDef * uart, uint16_t id)
+void gridTalk_init(gridTalk_t *gt, void *hw, uint16_t id)
 {
   memset(gt, 0, sizeof(*gt));
-  gt->uart = uart;
+  gt->hw = hw;
   gt->byteUs = GT_DEFAULT_BYTE_US;
+  gt->byteUsPending = gt->byteUs;
   gt->idleGuardUs = GT_IDLE_GUARD_US;
   gt->txDelayUs = GT_TX_DELAY_US;
   gt->ackWaitMinUs = (uint32_t)GT_ACK_WINDOW_MIN_MS * 1000u;
@@ -781,6 +775,17 @@ void gridTalk_init(gridTalk_t *gt, USART_TypeDef * uart, uint16_t id)
      与接收端连续落后重同步(GT_SEQ_DESYNC_FRAMES)共同保证 */
   for(uint8_t i = 0; i < 16; ++i) (void)gtRng(gt);
   gt->txSeqCounter = (uint16_t)gtRng(gt);
+}
+
+/* 按波特率定标字节时间(10bit/字节 = 1起始+8数据+1停止):
+   已知波特率时接入即准, 免自适应收敛; 未调用则从GT_DEFAULT_BYTE_US(9600)起步,
+   由帧内间隔采样自适应收敛(见gridTalk_rxByte的采样窗口) */
+void gridTalk_setBaud(gridTalk_t *gt, uint32_t baud)
+{
+  if(baud < 300u) baud = 300u;
+  gt->byteUs = 10000000u / baud;
+  if(gt->byteUs < 2u) gt->byteUs = 2u;
+  gt->byteUsPending = gt->byteUs;
 }
 
 /* 板级注入每次上电不同的熵(如 DWT计数值^HAL_GetTick^UID字), 重定序号基值:

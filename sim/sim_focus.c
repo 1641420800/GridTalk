@@ -11,7 +11,7 @@
  * 场景F: t=13000ms 节点1 执行"0x0C发急停信号给2号"(gridTalk_send(2,0x0101))
  * 场景G: t=16000ms 节点1 执行"0x0D发恢复给2号"(gridTalk_send(2,0x0102))
  *
- * 编译(复用现有main.h):
+ * 编译(与build_run.ps1同一方式, 需GridTalk.c同目录):
  *   cl /nologo /std:c11 /W3 /O2 /utf-8 /I. /I..\..\MX_autoMata\Core\GridTalk ^
  *      /c ..\..\MX_autoMata\Core\GridTalk\GridTalk.c /Fogridtalk_focus.obj
  *   cl /nologo /std:c11 /W3 /O2 /utf-8 /I. /I..\..\MX_autoMata\Core\GridTalk ^
@@ -30,10 +30,12 @@
 static gridTalk_t gts[NDEV];
 
 typedef struct {
-  USART_TypeDef uart;
   uint16_t id;
   uint8_t  tickPhase;
 
+  /* 仿真UART发送侧状态(经txKick/txKickDone/txAbort钩子置位, 替代伪造寄存器) */
+  uint8_t  txIrqEn;        /* TXE中断已开(库请求交付字节) */
+  uint8_t  tcArm;          /* 等TC(末字节已交付) */
   uint8_t  txDrFull;
   uint8_t  txDrByte;
   uint8_t  wireActive;
@@ -79,10 +81,29 @@ static void sim_tx_byte(gridTalk_t *gt, uint8_t c)
 {
   int n = (int)(gt - gts);
   dev_t *d = &devs[n];
-  d->uart.DR = c;
   d->txDrFull = 1;
   d->txDrByte = c;
   d->tcSet = 0;
+}
+
+/* 发送中断控制钩子: 替代伪造寄存器的CR1位操作 */
+static void sim_tx_kick(gridTalk_t *gt)       /* 开TXE中断 */
+{
+  devs[(int)(gt - gts)].txIrqEn = 1;
+}
+
+static void sim_tx_kick_done(gridTalk_t *gt)  /* 关TXE开TC(末字节已交付) */
+{
+  dev_t *d = &devs[(int)(gt - gts)];
+  d->txIrqEn = 0;
+  d->tcArm = 1;
+}
+
+static void sim_tx_abort(gridTalk_t *gt)      /* 卡死兜底: 关发送中断 */
+{
+  dev_t *d = &devs[(int)(gt - gts)];
+  d->txIrqEn = 0;
+  d->tcArm = 0;
 }
 
 static void on_rx(gridTalk_t *gt, uint16_t src, uint16_t cmd,
@@ -162,18 +183,17 @@ static void on_send_result(gridTalk_t *gt, uint16_t target, uint16_t cmd, uint8_
 /* ================= 周期任务(与sim.c同构) ================= */
 static void tick_one(int i)
 {
-  devs[i].uart.SR = (devs[i].txDrFull ? 0u : USART_SR_TXE) |
-                    (devs[i].tcSet ? USART_SR_TC : 0u);
   gridTalk_usTick(&gts[i], DT_US);
 
 #if GT_TX_IRQ
-  if((devs[i].uart.CR1 & USART_CR1_TXEIE) && (devs[i].uart.SR & USART_SR_TXE))
+  /* 仿真UART发送中断: TXE事件(DR空)逐字节交付, TC事件(移位完成)帧收尾 */
+  if(devs[i].txIrqEn && gts[i].txRingCount > 0 && !devs[i].txDrFull)
   {
     gridTalk_txIrq(&gts[i]);
   }
-  if((devs[i].uart.CR1 & USART_CR1_TCIE) && devs[i].tcSet)
+  if(devs[i].tcArm && devs[i].tcSet && gts[i].txRingCount == 0)
   {
-    gridTalk_txIrq(&gts[i]);
+    gridTalk_txCompleteIrq(&gts[i]);
   }
   if(devs[i].tcSet && gts[i].txState != GT_TX_SENDING) devs[i].tcSet = 0;
 #endif
@@ -267,11 +287,13 @@ static void init_all(void)
   for(int i = 0; i < NDEV; ++i)
   {
     memset(&devs[i], 0, sizeof(devs[i]));
-    devs[i].uart.sim = &devs[i];
     devs[i].id = (uint16_t)i;
-    gridTalk_init(&gts[i], &devs[i].uart, (uint16_t)i);
+    gridTalk_init(&gts[i], NULL, (uint16_t)i);
     gts[i].nowUs = sim_now_us;
     gts[i].txByte = sim_tx_byte;
+    gts[i].txKick = sim_tx_kick;
+    gts[i].txKickDone = sim_tx_kick_done;
+    gts[i].txAbort = sim_tx_abort;
     gts[i].onRx = on_rx;
     gts[i].onSendResult = on_send_result;
     devs[i].tickPhase = (uint8_t)(i * 3 % SIM_US);
