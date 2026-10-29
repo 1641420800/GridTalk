@@ -1,3 +1,6 @@
 *.obj
 *.exe
 sim/_build.bat
+
+# 本地留存的历史调查文档不入公共仓(副本在 ../GridTalk-local-docs/)
+docs/history/

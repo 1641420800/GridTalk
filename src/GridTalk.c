@@ -15,7 +15,7 @@
      rem += dTick; nowUs += rem/tickPerUs; rem %= tickPerUs
    使µs基满足差值契约"任意两次读数的无符号差 ≡ 真实流逝µs (mod 2^32)"。
    直接"读数/每µs tick数"再相减不满足: 2^32非整除时回绕后差值失真
-   (100MHz的CYCCNT/100实测读出~71.5min假值 -> 假超时, 见docs/history)。
+   (100MHz的CYCCNT/100实测读出~71.5min假值 -> 假超时)。
    采样间隔须小于计数器一个回绕周期(100MHz约42.9s): 由"周期调用
    gridTalk_usTick(建议1ms)"的公开约定保证; 其间被收发路径额外读取
    只会让采样更密, 无害。

@@ -32,7 +32,6 @@ app/    gridtalk_pipe.*            应用组件: 可靠有序字节管道(分片
         gridtalk_pipe_stdio.h      管道stdio适配(fopencookie/fdevopen自动探测)
 sim/                                PC 总线仿真器（编译真实 src/GridTalk.c）
 docs/    GridTalk协议设计.md       分层设计说明（L1物理/L2链路/L3应用）
-docs/history/                      历史缺陷调查记录（环形级联随机冻结 = DWT 回绕缺陷）
 ```
 
 ## 接入方法

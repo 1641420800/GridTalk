@@ -80,7 +80,7 @@ static inline void gridTalk_portUsartIsr(gridTalk_t *gt)
 /* ---- µs时基绑定(DWT CYCCNT): 库内余数精确换算, 免回绕失真 ----
    不得把"自由计数器先除后换算"(如CYCCNT/100)直接接 gt->nowUs: 2^32/100
    非整数, 计数回绕后差值失真(100MHz下每~43s制造一批假超时, 差值读出
-   ~71.5min假值, 见docs/history)。绑定后µs基由库内累加器维护, 采样率由
+   ~71.5min假值)。绑定后µs基由库内累加器维护, 采样率由
    周期调用 gridTalk_usTick 保证(须小于计数回绕周期, 100MHz约42.9s;
    1ms节拍即满足)。时基取 SystemCoreClock(须与实际主频一致, 特殊频率可
    事后改写 gt->tickPerUs)。可多实例共用/运行中绑定, 不清零CYCCNT。 */
