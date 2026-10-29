@@ -101,6 +101,8 @@ sim.exe [时长秒=120] [每字节误码率%=0.4] [设备数=6] [随机种子=42
 - `GT_IDLE_CHARS_X10` 空闲判定(4.5字符)、`GT_AUTO_BACKOFF_CHARS` 自主帧随机退避、
   `GT_ACK_WINDOW_CHARS` ACK窗口(60字符, 下限250ms)、`GT_SEQ_WINDOW` 序号去重窗口、
   `GT_TX_FIFO_SIZE` 发送缓存(8)、`GT_RESEND_COUNT` 重发次数(5)。
+- 应用层组件 `app/gridtalk_pipe.h`: `GTPIPE_RX_SIZE` 接收环形、`GTPIPE_TX_SIZE`
+  发送环形、`GTPIPE_SEG_MAX` 单段上限(由帧上限推导)、`GTPIPE_MAX` 每实例管道数。
 
 ## 调试开关（环境变量）
 

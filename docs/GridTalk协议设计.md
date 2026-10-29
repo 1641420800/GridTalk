@@ -32,7 +32,7 @@ GridTalk 是 STM32F411 双板系统（`MX_autoMata` 控制器 / `MX_remoteContro
   （ARM/CMSIS 编译器自动接入随库端口，其余平台默认空操作或 `GT_PORT_HEADER`
   指定）；时间源 `nowUs`（µs 时钟，真机用 DWT）、发送出口 `txByte`（逐字节）、
   发送中断控制 `txKick/txKickDone/txAbort`（开 TXE / 转等 TC / 卡死兜底；
-  全 NULL 回退轮询节流，可选 `txReady` 背压）；`hw` 为平台句柄。
+  全 NULL 回退轮询节流）；`hw` 为平台句柄。
   STM32 寄存器直写封装在 `port/gridtalk_port_stm32.h`（`gridTalk_portBindUart`）；
   中断驱动下 TC 收尾只由平台 TC 事件（`gridTalk_txCompleteIrq`）驱动——
   末字节"写入 DR"到"移位完成"之间可能隔着排队/上线时间，纯时间推算会提前
@@ -131,6 +131,17 @@ GridTalk 是 STM32F411 双板系统（`MX_autoMata` 控制器 / `MX_remoteContro
 - 每实例独立 RNG（xorshift），替代共享 `rand()`；
 - 发送分三类：`gridTalk_send`（自主可靠）、`gridTalk_sendReply`（响应，立即接入）、
   `gridTalk_sendNoAck`（尽力而为，轮询/探测用）。
+
+### 应用组件（app/，可选叠加）
+- **可靠有序字节管道（gridtalk_pipe）**：一条总线实例上若干互不影响的管道
+  （管道号+对端ID）。停等式分段（CMD `0x0F00`，载荷 `[pipeId][len(2)][data]`，
+  段长≤帧上限），复用 L2 的 needAck 重发与序号去重 ⇒ 字节流天然
+  **有序 + 恰好一次**，无需自建流控协议。
+  - `gtpipe_writeAll/readAll`：大数据分片传输（零拷贝、进度回调、停等）；
+  - `gtpipe_printf` / `gtpipe_fopen`（有 stdio 后端时 `fprintf/fscanf` 直接用于管道）；
+  - hub 链式接管回调：管道流量被消化，业务流量透传给应用原回调，应用零改动；
+  - 语义边界：writeAll 失败(-1)时末段是否已达对端未知（重试整个传输）；
+    接收环形读慢会溢出丢段（置标志保有序）。
 
 ### 面临的问题
 1. 全局单例无法在同进程创建多实例，仿真只能编译多份 + 符号重命名；
