@@ -29,7 +29,7 @@
 # 设计说明
 
 - 多实例: 全部状态封装在gridTalk_t结构体内, 同一进程可创建多个独立实例,
-  不再依赖全局单例; 平台通过钩子(nowUs/txByte)接入时间源与发送硬件。
+  不再依赖全局单例; 平台通过钩子(nowTick/nowUs/txByte)接入时间源与发送硬件。
 
 - 帧格式: 目标ID(2) + 源ID(2) + 序号(2) + CMD(2) + 数据(N) + Fletcher-16(2)
   转义: FF 00 起始 ... FF FE 结束; 帧内FF转义为FF FF;
@@ -53,14 +53,18 @@
 - 调用约定:
     gridTalk_init(gt, hw, id);        // hw=平台句柄(如USART2), 纯钩子接入可传NULL
     gridTalk_setBaud(gt, 9600);       // 可选: 已知波特率直接定标byteUs(推荐)
-    gt->nowUs = 平台us时钟(如DWT);    // NULL则用usTick累加时钟
+    gt->nowTick = 原始自由计数器读数;  // 推荐(如DWT->CYCCNT): 配套tickPerUs, 库内
+                                      // 余数精确换算µs(STM32一行: portBindDwt)
+    gt->nowUs = 差值回绕一致的µs时钟;  // 备选, 硬性契约见结构体接缝注释
+                                      // (自由计数器先除后换算不满足, 勿接!)
+    // 两者皆NULL则用usTick累加时钟
     gt->txByte = 平台发送函数;        // 唯一发送出口(逐字节)
     中断驱动(推荐): gt->txKick/txKickDone/txAbort = 发送中断控制钩子
                     (STM32一行绑定: gridTalk_portBindUart(gt), 见port/);
     轮询驱动: 上述三钩子保持NULL, usTick/rxByte入口按byteUs节流逐字节发送
-              (可选 gt->txReady 背压: 硬件未就绪时不写)
     gt->onRx = 接收回调;  gt->onSendResult = 发送结果回调;
-    周期调用 gridTalk_usTick(gt, us); // 建议1ms或更快
+    周期调用 gridTalk_usTick(gt, us); // 建议1ms或更快; nowTick换算累加器亦由
+                                      // 本入口服务(采样间隔须<计数回绕周期, 见gtClockSample)
     UART RX中断调用 gridTalk_rxByte(gt, c);
     中断驱动: TXE中断调用 gridTalk_txIrq(gt)(可交付1字节),
               TC中断调用 gridTalk_txCompleteIrq(gt)(末字节移位完成)
@@ -161,8 +165,7 @@
    1 = 中断驱动(推荐): 平台提供 txKick/txKickDone/txAbort 钩子, 字节节奏由硬件
        TXE中断决定, 不受usTick周期限制; 最后一字节移位完成后由TC中断收尾
        (gridTalk_txIrq / gridTalk_txCompleteIrq 为平台中断入口);
-   0 = 轮询: 上述钩子不接, 依赖usTick/rxByte入口, 每入口按byteUs节流发1字节
-       (可选txReady背压) */
+   0 = 轮询: 上述钩子不接, 依赖usTick/rxByte入口, 每入口按byteUs节流发1字节 */
 #ifndef GT_TX_IRQ
 #define GT_TX_IRQ 1
 #endif
@@ -174,9 +177,9 @@ typedef struct gridTalk gridTalk_t;
 
 typedef void (*gt_txByte_cb)(gridTalk_t *gt, uint8_t c);
 typedef uint32_t (*gt_nowUs_cb)(void);
+typedef uint32_t (*gt_nowTick_cb)(void);   /* 原始自由计数器读数(不做任何换算) */
 typedef void (*gt_txFrame_cb)(gridTalk_t *gt);   /* 帧开始/结束(485半双工方向控制, 可选) */
 typedef void (*gt_txCtrl_cb)(gridTalk_t *gt);    /* 发送中断控制: txKick/txKickDone/txAbort */
-typedef uint8_t (*gt_txReady_cb)(gridTalk_t *gt);/* 轮询模式背压: 硬件可再收1字节? */
 typedef void (*gt_readData_cb)(gridTalk_t *gt, uint16_t src, uint16_t cmd,
                                const uint8_t *data, uint16_t len);
 typedef void (*gt_sendResult_cb)(gridTalk_t *gt, uint16_t target, uint16_t cmd, uint8_t ok);
@@ -216,15 +219,35 @@ struct gridTalk {
   void *hw;                 /* 平台句柄(如USART_TypeDef*), 核心不解释; 供端口钩子取回硬件 */
   uint16_t id;
 
-  /* 平台钩子 */
+  /* ---- 平台接缝(核心库与芯片世界的全部边界) ----
+     必选(时间源, 三选一):
+       nowTick 原始自由计数器读数(如DWT->CYCCNT, 一次寄存器读, 不做换算),
+               配套 tickPerUs(每µs的tick数=主频MHz)。库内做余数精确µs换算
+               (推荐, 免回绕失真; STM32一行 gridTalk_portBindDwt, 见port/)。
+       或
+       nowUs   µs时钟。硬性契约: 任意两次读数的无符号差 ≡ 真实流逝µs (mod 2^32)。
+               注意"自由计数器先除后换算"不满足! 2^32/100非整数, CYCCNT/100在
+               计数回绕后差值读出~71.5min假值(截断损失无法事后修复) -> 状态机
+               假超时(现场级联环信号静默死亡)。自由计数器一律走nowTick;
+               只有天然µs源或已做库外精确累加的时钟才接nowUs。
+       两者皆NULL则用usTick累加时钟(软件节拍, 精度=调用周期)。
+     必选:
+       txByte  发送出口(逐字节)
+     二选一(发送驱动):
+       中断驱动(推荐): txKick/txKickDone/txAbort 三钩子
+         (STM32一行 gridTalk_portBindUart, 见port/gridtalk_port_stm32.h);
+         字节节奏由硬件TXE/TC中断决定
+       轮询: 三钩子全NULL, usTick/rxByte入口按byteUs节流逐字节送txByte
+     可选:
+       txFrameStart/txFrameEnd  485半双工方向控制(轮询模式也需要)
+       onRxRaw                  调试: 每完整帧(含坏帧)
+       hw                       平台句柄(核心不解释, 供钩子取回硬件) */
   gt_txByte_cb    txByte;   /* 发送出口(逐字节); NULL=无输出途径, 帧滞留队列 */
-  /* 发送中断控制(GT_TX_IRQ=1时由平台提供, 见port/gridtalk_port_stm32.h);
-     三者全NULL则该实例回退轮询节奏(usTick/rxByte入口按byteUs节流送txByte) */
   gt_txCtrl_cb    txKick;      /* 帧字节已备好, 启动发送(平台: 开TXE中断) */
   gt_txCtrl_cb    txKickDone;  /* 末字节已交付, 转等发送完成(平台: 关TXE开TC) */
   gt_txCtrl_cb    txAbort;     /* 发送卡死兜底(平台: 关发送中断/清挂起标志) */
-  gt_txReady_cb   txReady;     /* 轮询模式可选背压: 硬件未就绪时不写 */
-  gt_nowUs_cb     nowUs;
+  gt_nowUs_cb     nowUs;    /* 备选µs时钟(须差值回绕一致, 见接缝注释); 优先后接nowTick */
+  gt_nowTick_cb   nowTick;  /* 原始自由计数器(推荐): 库内余数精确换算µs, 见接缝注释 */
   gt_txFrame_cb   txFrameStart;      /* 帧开始发送(置485为发送方向, 可空) */
   gt_txFrame_cb   txFrameEnd;        /* 帧发送完成(485恢复接收方向, 可空) */
   gt_readData_cb  onRx;
@@ -234,6 +257,11 @@ struct gridTalk {
   /* 时钟 */
   uint32_t _nowUs;
   uint32_t _lastPollUs;
+  uint32_t tickPerUs;       /* nowTick计数率(tick/µs): init默认1(计数即µs), 绑定
+                               真实计数器时平台改写(DWT=主频MHz) */
+  uint32_t _lastTick;       /* nowTick路径: 上次原始计数读数 */
+  uint32_t _rem;            /* nowTick路径: 未满1µs的tick余数(余数精确累加,
+                               见gtClockSample, 防整除截断在回绕处累积失真) */
 
   /* 自适应实测字节速率(us) */
   uint32_t byteUs;

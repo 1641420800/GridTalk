@@ -7,6 +7,7 @@
  *   gridTalk_init(&gt, USART2, myID);   // hw = USART外设
  *   gridTalk_portBindUart(&gt);          // txByte写DR + txKick等中断控制, 一行绑定
  *   // USART2_IRQHandler 里调用 gridTalk_portUsartIsr(&gt);
+ * 时基(推荐再加一行): gridTalk_portBindDwt(&gt); // DWT->CYCCNT, 库内余数精确换算µs
  *
  * 包含顺序: 须先让 USART_TypeDef / USART_CR1_TXEIE / USART_SR_TC 可见。
  * 默认包含 "main.h"(Cube工程惯例), 可经 GT_STM32_DEVICE_HEADER 覆盖。
@@ -47,12 +48,6 @@ static inline void gtPort_txAbort(gridTalk_t *gt)
   u->SR  &= (uint32_t)~USART_SR_TC;
 }
 
-/* 轮询模式可选背压: DR空(可再收1字节)? */
-static inline uint8_t gtPort_txReady(gridTalk_t *gt)
-{
-  return (((USART_TypeDef *)gt->hw)->SR & USART_SR_TXE) != 0u;
-}
-
 /* 一键绑定(在 gridTalk_init 之后调用) */
 static inline void gridTalk_portBindUart(gridTalk_t *gt)
 {
@@ -60,7 +55,6 @@ static inline void gridTalk_portBindUart(gridTalk_t *gt)
   gt->txKick     = gtPort_txKick;
   gt->txKickDone = gtPort_txKickDone;
   gt->txAbort    = gtPort_txAbort;
-  gt->txReady    = gtPort_txReady;
 }
 
 /* USART中断服务程序统一入口:
@@ -81,5 +75,28 @@ static inline void gridTalk_portUsartIsr(gridTalk_t *gt)
     u->CR1 &= (uint32_t)~USART_CR1_TCIE;
     gridTalk_txCompleteIrq(gt);
   }
+}
+
+/* ---- µs时基绑定(DWT CYCCNT): 库内余数精确换算, 免回绕失真 ----
+   不得把"自由计数器先除后换算"(如CYCCNT/100)直接接 gt->nowUs: 2^32/100
+   非整数, 计数回绕后差值失真(100MHz下每~43s制造一批假超时, 差值读出
+   ~71.5min假值, 见docs/history)。绑定后µs基由库内累加器维护, 采样率由
+   周期调用 gridTalk_usTick 保证(须小于计数回绕周期, 100MHz约42.9s;
+   1ms节拍即满足)。时基取 SystemCoreClock(须与实际主频一致, 特殊频率可
+   事后改写 gt->tickPerUs)。可多实例共用/运行中绑定, 不清零CYCCNT。 */
+static inline uint32_t gtPort_dwtTick(void)
+{
+  return DWT->CYCCNT;
+}
+
+/* 一键绑定(在 gridTalk_init 之后调用) */
+static inline void gridTalk_portBindDwt(gridTalk_t *gt)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   /* 释放DWT(已使能则无害) */
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  gt->nowTick   = gtPort_dwtTick;
+  gt->tickPerUs = SystemCoreClock / 1000000u;
+  if(gt->tickPerUs == 0u) gt->tickPerUs = 1u;
+  gt->_lastTick = DWT->CYCCNT;   /* 与当前计数对齐(不清零, 兼容多实例) */
 }
 #endif /* GRIDTALK_PORT_STM32_H */

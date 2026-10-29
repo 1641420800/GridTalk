@@ -9,8 +9,46 @@
    同一逻辑命令经多信道发送共用一个序号, 接收端跨信道去重) */
 #define GT_SEQ_DOMAIN(gt) ((gt)->seqDomain ? (gt)->seqDomain : (gt))
 
+/* 时钟读取。
+   nowTick路径(自由计数器, 推荐): 余数精确累加换算µs --
+   差值先在原始计数域取模(无符号减法天然回绕安全), 除法只作用于增量且余数留存:
+     rem += dTick; nowUs += rem/tickPerUs; rem %= tickPerUs
+   使µs基满足差值契约"任意两次读数的无符号差 ≡ 真实流逝µs (mod 2^32)"。
+   直接"读数/每µs tick数"再相减不满足: 2^32非整除时回绕后差值失真
+   (100MHz的CYCCNT/100实测读出~71.5min假值 -> 假超时, 见docs/history)。
+   采样间隔须小于计数器一个回绕周期(100MHz约42.9s): 由"周期调用
+   gridTalk_usTick(建议1ms)"的公开约定保证; 其间被收发路径额外读取
+   只会让采样更密, 无害。
+   nowUs路径: 平台自备差值回绕一致的µs源; 两者皆无: usTick软件累加。
+   须在GT_CRIT临界区内调用gtClockSample: 状态被任务与ISR上下文共享。 */
+static void gtClockSample(gridTalk_t *gt)
+{
+  uint32_t t = gt->nowTick();
+  uint32_t d = (uint32_t)(t - gt->_lastTick);
+  if(gt->tickPerUs <= 1u)   /* 计数即µs(或未配置): 免除法 */
+  {
+    gt->_nowUs += d;
+  }
+  else
+  {
+    uint32_t q;
+    gt->_rem += d;
+    q = gt->_rem / gt->tickPerUs;
+    gt->_nowUs += q;
+    gt->_rem -= q * gt->tickPerUs;
+  }
+  gt->_lastTick = t;
+}
+
 static uint32_t gtNowUs(gridTalk_t *gt)
 {
+  if(gt->nowTick)
+  {
+    GT_CRIT_ENTER();   /* 保存/恢复式, 允许嵌套(usTick/rxByte临界区内读时钟) */
+    gtClockSample(gt);
+    GT_CRIT_EXIT();
+    return gt->_nowUs;
+  }
   return gt->nowUs ? gt->nowUs() : gt->_nowUs;
 }
 
@@ -219,12 +257,12 @@ static void gtDrain(gridTalk_t *gt)
      会提前收尾使状态机与空中时序脱节。TC中断丢失的故障路径由上面的
      SENDING卡死兜底覆盖(txAbort+收尾), 只是恢复更慢 */
 #else
-  /* 轮询模式: 按实测字节速率节流逐字节送txByte(可选txReady背压) */
+  /* 轮询模式: 按实测字节速率节流逐字节送txByte(byteUs准确性由CRC门控自适应
+     与setBaud保证, 纯时间节流即可; 卡死兜底见上) */
   if(gt->txState == GT_TX_SENDING)
   {
     while(gt->txRingCount > 0 && (now - gt->lastTxByteUs) >= gt->byteUs)
     {
-      if(gt->txReady && !gt->txReady(gt)) break;
       uint8_t c;
       gtRingRead(gt, &c);
       if(gt->txByte) gt->txByte(gt, c);
@@ -722,7 +760,14 @@ void gridTalk_rxByte(gridTalk_t *gt, uint8_t c)
 void gridTalk_usTick(gridTalk_t *gt, uint32_t us)
 {
   GT_CRIT_ENTER();
-  if(!gt->nowUs) gt->_nowUs += us;
+  if(gt->nowTick)
+  {
+    gtClockSample(gt);   /* 服务换算累加器: 采样率由本入口的周期调用保证 */
+  }
+  else if(!gt->nowUs)
+  {
+    gt->_nowUs += us;
+  }
   gtDrain(gt);
   GT_CRIT_EXIT();
 }
@@ -769,6 +814,7 @@ void gridTalk_init(gridTalk_t *gt, void *hw, uint16_t id)
   gt->idleGuardUs = GT_IDLE_GUARD_US;
   gt->txDelayUs = GT_TX_DELAY_US;
   gt->ackWaitMinUs = (uint32_t)GT_ACK_WINDOW_MIN_MS * 1000u;
+  gt->tickPerUs = 1u;   /* nowTick默认计数即µs; 绑定真实计数器时平台改写(DWT=主频MHz) */
   gridTalk_setID(gt, id);
   /* 小种子(设备号)的xorshift输出近似线性(实测相邻设备基值差~8225), 先空转打散
      再取基值. 基值仍由ID确定性决定, 跨上电随机性由 gridTalk_seed(板级注入熵)
